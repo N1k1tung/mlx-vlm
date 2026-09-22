@@ -1,7 +1,27 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from ..base import BaseModelConfig
+
+
+@dataclass
+class VisionConfig(BaseModelConfig):
+    depth: int = 0
+    hidden_size: int = 1280
+    intermediate_size: int = 4608
+    out_hidden_size: int = 4096
+    num_heads: int = 32
+    num_key_value_heads: int = 8
+    qk_channels: int = 64
+    in_chans: int = 3
+    patch_size: int = 16
+    temporal_patch_size: int = 2
+    spatial_merge_size: int = 2
+    fullatt_block_indexes: List[int] = field(default_factory=list)
+    vit_window_attn_types: List[int] = field(default_factory=list)
+    visual_token_window_size: int = 64
+    use_sink: bool = True
+    rms_norm_eps: float = 1e-6
 
 
 @dataclass
@@ -39,3 +59,11 @@ class ModelConfig(BaseModelConfig):
     swa_head_dim: int
     swa_v_head_dim: int
     partial_rotary_factor: float
+    attention_value_scale: float = 1.0
+    moe_router_dtype: Optional[str] = None
+    vision_config: Optional[VisionConfig] = None
+    image_token_id: int = 151655
+
+    def __post_init__(self):
+        if isinstance(self.vision_config, dict):
+            self.vision_config = VisionConfig.from_dict(self.vision_config)

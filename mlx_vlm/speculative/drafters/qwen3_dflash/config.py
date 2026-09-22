@@ -32,6 +32,8 @@ class DFlashConfig(BaseModelConfig):
     draft_window_size: int | None = None
     is_causal: bool = False
     attention_sink_bias: bool = False
+    partial_rotary_factor: float = 1.0
+    attention_value_scale: float = 1.0
 
     @classmethod
     def from_dict(cls, params: dict) -> "DFlashConfig":
@@ -53,6 +55,8 @@ class DFlashConfig(BaseModelConfig):
             flat["is_causal"] = bool(flat.pop("dflash_query_causal"))
         if "attention_sink_bias" in dflash_cfg:
             flat["attention_sink_bias"] = bool(dflash_cfg["attention_sink_bias"])
+        if "attention_value_scale" in dflash_cfg:
+            flat["attention_value_scale"] = dflash_cfg["attention_value_scale"]
         if "num_target_layers" not in flat and flat.get("target_layer_ids"):
             flat["num_target_layers"] = max(flat["target_layer_ids"]) + 1
         rope_parameters = flat.pop("rope_parameters", None)

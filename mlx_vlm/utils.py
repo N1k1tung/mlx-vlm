@@ -35,6 +35,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "mimo_v2": "mimo_v2_flash",
     "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
     "llava-qwen2": "llava_bunny",
@@ -1037,7 +1038,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 
-                weights, quantization = transform_fp8_weights(weights, config)
+                if (
+                    config.get("model_type") in ("mimo_v2", "mimo_v2_flash")
+                    and config.get("attention_projection_layout") == "fused_qkv"
+                ):
+                    from .models.mimo_v2_flash.checkpoint import transform_mimo_weights
+
+                    weights, quantization = transform_mimo_weights(weights, config)
+                else:
+                    weights, quantization = transform_fp8_weights(weights, config)
                 # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
                 if quantization is None and config.get("model_type") == "deepseek_v4":
                     from .models.deepseek_v4.language import make_quantization_config

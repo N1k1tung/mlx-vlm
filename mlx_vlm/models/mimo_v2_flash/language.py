@@ -36,6 +36,7 @@ class Attention(nn.Module):
             rope_theta = args.rope_theta
 
         self.scale = head_dim**-0.5
+        self.value_scale = args.attention_value_scale
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -61,6 +62,8 @@ class Attention(nn.Module):
         B, L, D = x.shape
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        if self.value_scale != 1.0:
+            values = values * self.value_scale
 
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -141,8 +144,13 @@ class MoEGate(nn.Module):
         assert config.topk_method == "noaux_tc", "Unsupported topk method."
 
     def __call__(self, x):
+        dtype = (
+            getattr(mx, self.config.moe_router_dtype)
+            if self.config.moe_router_dtype is not None
+            else x.dtype
+        )
         return group_expert_select(
-            x @ self.weight.T,
+            x.astype(dtype) @ self.weight.astype(dtype).T,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
@@ -230,6 +238,8 @@ class MimoModel(nn.Module):
         x: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
     ) -> mx.array:
         h = self.embed_tokens(x) if inputs_embeds is None else inputs_embeds
 
@@ -241,9 +251,12 @@ class MimoModel(nn.Module):
             h, cache[self.swa_idx], window_size=self.sliding_window_size
         )
 
-        for l, c in zip(self.layers, cache):
+        capture = set(capture_layer_ids or ())
+        for i, (l, c) in enumerate(zip(self.layers, cache)):
             mask = swa_mask if l.is_sliding_window else full_mask
             h = l(h, mask, cache=c)
+            if hidden_sink is not None and i in capture:
+                hidden_sink.append(h)
 
         return self.norm(h)
 
@@ -259,9 +272,14 @@ class LanguageModel(nn.Module):
     def __call__(
         self, inputs: mx.array, cache=None, inputs_embeds=None, mask=None, **kwargs
     ):
-        out = self.model(inputs, cache, inputs_embeds=inputs_embeds)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        hidden_sink = [] if capture_layer_ids is not None else None
+        out = self.model(
+            inputs, cache, inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids, hidden_sink=hidden_sink,
+        )
         out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden_sink)
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):

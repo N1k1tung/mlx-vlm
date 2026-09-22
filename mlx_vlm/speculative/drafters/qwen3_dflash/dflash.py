@@ -19,8 +19,11 @@ def _build_rope(config: DFlashConfig):
     # checkpoints expose rope_is_neox_style explicitly; MLX calls the
     # interleaved GPT-J pairing "traditional".
     traditional = not bool(getattr(config, "rope_is_neox_style", True))
+    dims = int(config.head_dim * getattr(config, "partial_rotary_factor", 1.0))
+    if dims <= 0 or dims > config.head_dim or dims % 2:
+        raise ValueError("DFlash rotary dimensions must be positive, even, and fit the head")
     return initialize_rope(
-        dims=config.head_dim,
+        dims=dims,
         base=config.rope_theta,
         traditional=traditional,
         scaling_config=config.rope_scaling,
@@ -36,6 +39,7 @@ class DFlashAttention(nn.Module):
         self.n_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.scale = self.head_dim**-0.5
+        self.value_scale = getattr(config, "attention_value_scale", 1.0)
         layer_types = (
             config.layer_types or ["full_attention"] * config.num_hidden_layers
         )
@@ -103,6 +107,9 @@ class DFlashAttention(nn.Module):
         prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(
             0, 2, 1, 3
         )
+        if self.value_scale != 1.0:
+            ctx_values = ctx_values * self.value_scale
+            prop_values = prop_values * self.value_scale
         queries = rope(queries, offset=cache.offset + S)
         ctx_keys = rope(ctx_keys, offset=cache.offset)
         prop_keys = rope(prop_keys, offset=cache.offset + S)
@@ -184,10 +191,22 @@ class DFlashDraftModel(nn.Module):
         self.lm_head = None
         self.argmax_from_hidden = None
         self._fused_context_kv_weight = None
+        self.mask_embedding = None
         self.accept_lens: List[int] = []
         self.draft_lens: List[int] = []
 
     def bind(self, target_model) -> "DFlashDraftModel":
+        lm = getattr(target_model, "language_model", target_model)
+        if getattr(lm, "model_type", None) == "mimo_v2":
+            if (
+                lm.args.hidden_size != self.config.hidden_size
+                or lm.args.vocab_size != self.config.vocab_size
+                or len(lm.layers) != self.config.num_target_layers
+                or any(i < 0 or i >= len(lm.layers) for i in self.config.target_layer_ids)
+            ):
+                raise ValueError("DFlash configuration is incompatible with the MiMo target")
+            if self.mask_embedding is None:
+                self._load_mask_embedding()
         if self.embed_tokens is None:
             if hasattr(target_model, "embed_tokens"):
                 inner = target_model
@@ -349,7 +368,45 @@ class DFlashDraftModel(nn.Module):
         return list(zip(chunks[::2], chunks[1::2]))
 
     def _embed_input_tokens(self, inputs: mx.array) -> mx.array:
-        return self.embed_tokens(inputs) * self.embed_scale
+        embeddings = self.embed_tokens(inputs) * self.embed_scale
+        if self.mask_embedding is not None:
+            embeddings = mx.where(
+                (inputs == self.config.mask_token_id)[..., None],
+                self.mask_embedding.astype(embeddings.dtype), embeddings,
+            )
+        return embeddings
+
+    def _load_mask_embedding(self):
+        import io
+        import zipfile
+        from pathlib import Path
+
+        import numpy as np
+
+        from ....models.sam3d_objects.checkpoint import Tensor, TensorUnpickler
+
+        path = Path(self.model_path) / "mask_embedding.pt"
+        with zipfile.ZipFile(path) as archive:
+            names = [name for name in archive.namelist() if name.endswith("/data.pkl")]
+            if len(names) != 1:
+                raise ValueError("DFlash mask checkpoint must contain one data.pkl")
+            prefix = names[0].removesuffix("data.pkl")
+            if archive.read(prefix + "byteorder") != b"little":
+                raise ValueError("DFlash mask checkpoint must be little-endian")
+            data = TensorUnpickler(io.BytesIO(archive.read(names[0]))).load()
+            tensor = data.get("embedding") if isinstance(data, dict) else None
+            if (
+                not isinstance(tensor, Tensor)
+                or data.get("mask_token_id") != self.config.mask_token_id
+                or tensor.shape != (self.config.hidden_size,) or tensor.stride != (1,)
+                or tensor.storage.kind != "BFloat16Storage" or tensor.offset != 0
+                or tensor.storage.size != self.config.hidden_size
+            ):
+                raise ValueError("DFlash mask embedding does not match the drafter configuration")
+            raw = archive.read(prefix + "data/" + tensor.storage.key)
+            if len(raw) != self.config.hidden_size * 2:
+                raise ValueError("DFlash mask embedding storage has an unexpected length")
+            self.mask_embedding = mx.array(np.frombuffer(raw, dtype="<u2")).view(mx.bfloat16)
 
     def _logits(self, hidden: mx.array) -> mx.array:
         logits = self.lm_head(hidden)

@@ -31,6 +31,7 @@ class MessageFormat(Enum):
 
 # Model configuration mapping
 MODEL_CONFIG = {
+    "mimo_v2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # List with image format models
     "jina_vlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "jvlm": MessageFormat.IMAGE_TOKEN_PIPE,
