@@ -1906,6 +1906,13 @@ def test_parser_contract(name):
         assert result.remaining_text == text
 
 
+def test_qwen3_coder_parser_accepts_full_model_output():
+    output = WIRE_CALLS["qwen3_coder"] + WIRE_CALLS["qwen3_coder"]
+    assert _parse("qwen3_coder", output, WEATHER_TOOLS) == _call(
+        "get_weather", city="Paris", days=3
+    )
+
+
 @pytest.mark.parametrize("name", PARSER_NAMES)
 def test_parser_selection(name):
     # Specific formats must outrank the generic JSON fallback.

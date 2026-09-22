@@ -14,6 +14,7 @@ import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
 _parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+_wrapped_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
 _bool_types = {"boolean", "bool", "binary"}
@@ -110,6 +111,11 @@ def parse_tool_call(
     model_output: str,
     tools: Optional[Any] = None,
 ):
+    # The shared extractor passes the envelope body, while direct consumers of
+    # parser modules may pass the complete model response. Direct consumers
+    # have a singular-call contract; process_tool_calls handles every envelope.
+    if wrapped_call := _wrapped_call_regex.search(model_output):
+        model_output = wrapped_call.group(1)
     match = _function_regex.findall(model_output)
     if not match:
         raise ValueError("No function provided.")
