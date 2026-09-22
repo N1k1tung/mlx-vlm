@@ -273,13 +273,19 @@ class LanguageModel(nn.Module):
         self, inputs: mx.array, cache=None, inputs_embeds=None, mask=None, **kwargs
     ):
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
         hidden_sink = [] if capture_layer_ids is not None else None
         out = self.model(
             inputs, cache, inputs_embeds=inputs_embeds,
             capture_layer_ids=capture_layer_ids, hidden_sink=hidden_sink,
         )
-        out = self.lm_head(out)
-        return LanguageModelOutput(logits=out, hidden_states=hidden_sink)
+        logits = self.lm_head(out)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=[out] if return_hidden else hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):

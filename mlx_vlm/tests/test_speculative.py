@@ -4,6 +4,7 @@ import importlib
 import json
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import asdict
 from itertools import product
 from math import prod
 from pathlib import Path
@@ -661,7 +662,7 @@ def split_checkpoint(
 
 def test_mimo_v2_mtp_split_load_and_forward(tmp_path):
     arch = module("speculative.drafters.mimo_v2_mtp")
-    text = module("models.mimo_v2_flash.check").tiny_config().to_dict()
+    text = asdict(module("models.mimo_v2_flash.check").tiny_config())
     text.update(
         model_type="mimo_v2",
         num_nextn_predict_layers=3,
@@ -712,6 +713,26 @@ def test_mimo_v2_mtp_split_load_and_forward(tmp_path):
     )
     mx.eval(tokens)
     assert tokens.shape == (1, 1)
+
+
+def test_mimo_v2_mtp_generation():
+    config = module("models.mimo_v2_flash.check").tiny_config()
+    model = module("models.mimo_v2_flash.mimo_v2_flash").Model(config)
+    arch = module("speculative.drafters.mimo_v2_mtp")
+    draft = arch.Model(arch.ModelConfig(text_config=config))
+    prompt = mx.array([[1, 2, 3]])
+    output = model.language_model(prompt, return_hidden=True, return_shared_kv=True)
+    assert output.hidden_states[0].shape == (1, 3, config.hidden_size)
+    assert output.shared_kv_states == {}
+
+    tokens = [
+        token
+        for token, _ in generate_step(
+            prompt, model, None, None, draft_model=draft, draft_kind="mtp",
+            max_tokens=3, temperature=0, prefill_step_size=None,
+        )
+    ]
+    assert len(tokens) == 3
 
 
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
