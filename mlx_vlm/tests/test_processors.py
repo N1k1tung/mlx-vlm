@@ -1840,7 +1840,7 @@ WIRE_CALLS = {
     "]<]minimax[>[</days>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>",
     "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
-    "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
+    "qwen3_coder": "<tool_call><function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
 }
 
