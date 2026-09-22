@@ -129,6 +129,18 @@ class MTPSplitter:
             q_mode or "affine",
         )
 
+    def transform_source_quantization(
+        self,
+        tensors: Dict[str, mx.array],
+        source_config: dict,
+        target_quantization: Optional[dict],
+    ) -> Tuple[Dict[str, mx.array], Optional[dict]]:
+        return transform_fp8_weights(
+            tensors,
+            source_config,
+            target_quantization=target_quantization,
+        )
+
     def quantization_from_source(
         self, tensors: Dict[str, mx.array], source_config: dict
     ) -> Optional[dict]:
@@ -239,10 +251,10 @@ class MTPSplitter:
             fp8_target_quantization = get_quantization_params(
                 quant_opts.get("q_group_size"), q_bits, q_mode or "affine"
             )
-        selected, transformed_quantization = transform_fp8_weights(
+        selected, transformed_quantization = self.transform_source_quantization(
             selected,
             source_config,
-            target_quantization=fp8_target_quantization,
+            fp8_target_quantization,
         )
         if transformed_quantization is not None:
             source_config = dict(source_config)
@@ -299,6 +311,8 @@ MTP_SPLITTERS: Dict[str, str] = {
     "glm5_next_text": "mlx_vlm.speculative.drafters.glm5_next_mtp.split:Glm5NextMTPSplitter",
     "glm_moe_dsa": "mlx_vlm.speculative.drafters.glm_moe_dsa_mtp.split:GlmMoeDsaMTPSplitter",
     "inkling_mm_model": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",
+    "mimo_v2": "mlx_vlm.speculative.drafters.mimo_v2_mtp.split:MimoV2MTPSplitter",
+    "mimo_v2_flash": "mlx_vlm.speculative.drafters.mimo_v2_mtp.split:MimoV2MTPSplitter",
 }
 
 

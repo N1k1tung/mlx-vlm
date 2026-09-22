@@ -659,6 +659,61 @@ def split_checkpoint(
     return config, weights, output
 
 
+def test_mimo_v2_mtp_split_load_and_forward(tmp_path):
+    arch = module("speculative.drafters.mimo_v2_mtp")
+    text = module("models.mimo_v2_flash.check").tiny_config().to_dict()
+    text.update(
+        model_type="mimo_v2",
+        num_nextn_predict_layers=3,
+        n_shared_experts=None,
+        routed_scaling_factor=None,
+    )
+    draft = arch.Model(arch.ModelConfig(text_config=text))
+    params = dict(tree_flatten(draft.parameters()))
+
+    q = params.pop("self_attn.q_proj.weight")
+    k = params.pop("self_attn.k_proj.weight")
+    v = params.pop("self_attn.v_proj.weight")
+    tp = text["num_key_value_heads"]
+    q_shards = mx.split(q, tp, axis=0)
+    k_shards = mx.split(k, tp, axis=0)
+    v_shards = mx.split(v, tp, axis=0)
+    prefix = "model.mtp.layers.0."
+    source = {prefix + key: value for key, value in params.items()}
+    source[prefix + "self_attn.qkv_proj.weight"] = mx.concatenate(
+        [
+            mx.concatenate([q_shards[i], k_shards[i], v_shards[i]], axis=0)
+            for i in range(tp)
+        ]
+    )
+
+    config, weights, _ = split_checkpoint(tmp_path, text, source)
+    assert config["model_type"] == "mimo_v2_mtp"
+    assert config["block_size"] == 2
+    assert config["text_config"]["num_nextn_predict_layers"] == 1
+    assert not any(key.startswith("model.mtp.") for key in weights)
+    assert "self_attn.qkv_proj.weight" not in weights
+
+    fresh = arch.Model(arch.ModelConfig.from_dict(config))
+    fresh.load_weights(list(weights.items()), strict=True)
+    hidden = mx.random.normal((1, 3, text["hidden_size"]))
+    result = fresh._forward_hidden(hidden, hidden, None, mx.arange(3)[None])
+    mx.eval(result)
+    assert result.shape == hidden.shape and mx.all(mx.isfinite(result)).item()
+
+    target = NS(
+        language_model=module("models.mimo_v2_flash.language").LanguageModel(
+            module("models.mimo_v2_flash.config").ModelConfig.from_dict(text)
+        )
+    )
+    cache = fresh.reset(target)
+    tokens = fresh.draft_block(
+        1, hidden[:, -1:], cache, block_size=4, sampler=greedy, greedy=True
+    )
+    mx.eval(tokens)
+    assert tokens.shape == (1, 1)
+
+
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
     arch = module("speculative.drafters.deepseek_v4_dspark")
     text = tiny_config("deepseek")

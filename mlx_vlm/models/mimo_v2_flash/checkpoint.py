@@ -9,6 +9,71 @@ from ...fp8 import (
 )
 
 
+def split_mimo_qkv_weights(
+    weights, config, prefix, *, sliding, target_quantization=None
+):
+    """Normalize one TP-interleaved MiMo QKV projection in place."""
+    weight_key = prefix + "qkv_proj.weight"
+    if weight_key not in weights:
+        return
+
+    weight = weights.pop(weight_key)
+    scale_key = prefix + "qkv_proj.weight_scale_inv"
+    scales = weights.pop(scale_key, None)
+    tp = config["num_key_value_heads"]
+    heads = config["swa_num_attention_heads" if sliding else "num_attention_heads"]
+    kv_heads = config[
+        "swa_num_key_value_heads" if sliding else "num_key_value_heads"
+    ]
+    head_dim = config["swa_head_dim" if sliding else "head_dim"]
+    value_dim = config["swa_v_head_dim" if sliding else "v_head_dim"]
+    if heads % tp or kv_heads % tp:
+        raise ValueError("MiMo QKV heads must be divisible by the export TP size")
+
+    sizes = (
+        heads // tp * head_dim,
+        kv_heads // tp * head_dim,
+        kv_heads // tp * value_dim,
+    )
+    rows = sum(sizes)
+    if weight.shape != (tp * rows, config["hidden_size"]):
+        raise ValueError(f"Invalid TP-interleaved MiMo QKV weight shape at {prefix}")
+
+    parts = {name: ([], [], []) for name in ("q_proj", "k_proj", "v_proj")}
+    if scales is not None:
+        scale_rows = (rows + 127) // 128
+        expected = (tp * scale_rows, (config["hidden_size"] + 127) // 128)
+        if scales.shape != expected:
+            raise ValueError(f"Invalid TP-interleaved MiMo QKV scale shape at {prefix}")
+
+    for rank in range(tp):
+        shard = weight[rank * rows : (rank + 1) * rows]
+        if scales is not None:
+            shard_scale = scales[rank * scale_rows : (rank + 1) * scale_rows]
+            quantized = _quantize_fp8_weight(
+                shard, shard_scale, target_quantization
+            )
+            packed, native_scales = quantized[:2]
+            native_biases = quantized[2] if len(quantized) == 3 else None
+        else:
+            packed, native_scales, native_biases = shard, None, None
+        offset = 0
+        for name, size in zip(parts, sizes):
+            parts[name][0].append(packed[offset : offset + size])
+            if native_scales is not None:
+                parts[name][1].append(native_scales[offset : offset + size])
+            if native_biases is not None:
+                parts[name][2].append(native_biases[offset : offset + size])
+            offset += size
+
+    for name, (packed, native_scales, native_biases) in parts.items():
+        weights[prefix + name + ".weight"] = mx.concatenate(packed)
+        if native_scales:
+            weights[prefix + name + ".scales"] = mx.concatenate(native_scales)
+        if native_biases:
+            weights[prefix + name + ".biases"] = mx.concatenate(native_biases)
+
+
 def transform_mimo_weights(weights, config):
     # Audio and the older next-token heads are not part of text/image inference.
     weights = {
@@ -16,44 +81,9 @@ def transform_mimo_weights(weights, config):
         if not k.startswith(("model.mtp.", "audio_encoder.", "speech_embeddings."))
     }
     quantization = dict(MLX_MXFP8_QUANTIZATION)
-    tp = config["num_key_value_heads"]
     for layer, sliding in enumerate(config["hybrid_layer_pattern"]):
         prefix = f"model.layers.{layer}.self_attn."
-        weight_key = prefix + "qkv_proj.weight"
-        if weight_key not in weights:
-            continue
-        weight = weights.pop(weight_key)
-        scales = weights.pop(prefix + "qkv_proj.weight_scale_inv")
-        heads = config["swa_num_attention_heads" if sliding else "num_attention_heads"]
-        kv_heads = config["swa_num_key_value_heads" if sliding else "num_key_value_heads"]
-        head_dim = config["swa_head_dim" if sliding else "head_dim"]
-        value_dim = config["swa_v_head_dim" if sliding else "v_head_dim"]
-        if heads % tp or kv_heads % tp:
-            raise ValueError("MiMo QKV heads must be divisible by the export TP size")
-        sizes = (heads // tp * head_dim, kv_heads // tp * head_dim, kv_heads // tp * value_dim)
-        rows = sum(sizes)
-        scale_rows = (rows + 127) // 128
-        if weight.shape != (tp * rows, config["hidden_size"]) or scales.shape != (
-            tp * scale_rows, (config["hidden_size"] + 127) // 128,
-        ):
-            raise ValueError(f"Invalid TP-interleaved MiMo QKV shapes at {prefix}")
-
-        # Each export shard is [Q_i, K_i, V_i], with its own 128-row
-        # scale-block origin (including a partial final block for GA layers).
-        parts = {name: ([], []) for name in ("q_proj", "k_proj", "v_proj")}
-        for rank in range(tp):
-            packed, native_scales = _quantize_fp8_weight(
-                weight[rank * rows:(rank + 1) * rows],
-                scales[rank * scale_rows:(rank + 1) * scale_rows],
-            )
-            offset = 0
-            for name, size in zip(parts, sizes):
-                parts[name][0].append(packed[offset:offset + size])
-                parts[name][1].append(native_scales[offset:offset + size])
-                offset += size
-        for name, (packed, native_scales) in parts.items():
-            weights[prefix + name + ".weight"] = mx.concatenate(packed)
-            weights[prefix + name + ".scales"] = mx.concatenate(native_scales)
+        split_mimo_qkv_weights(weights, config, prefix, sliding=bool(sliding))
 
     for key in list(weights):
         if not key.endswith(".weight_scale") or ".mlp.experts." not in key:

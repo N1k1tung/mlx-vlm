@@ -37,6 +37,7 @@ source (which still carries `mtp.*`).
 | `deepseek_v4` | `deepseek_v4_mtp` |
 | `glm4_moe_lite` | `glm4_moe_lite_mtp` |
 | `inkling_mm_model` | `inkling_mtp` |
+| `mimo_v2`, `mimo_v2_flash` | `mimo_v2_mtp` (first predictor stage) |
 
 Detection is **tensor-presence based** — a config flag alone is not trusted
 (some models declare MTP but ship no tensors; others ship tensors with no flag).
