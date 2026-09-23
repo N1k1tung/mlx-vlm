@@ -10,10 +10,12 @@ import numpy as np
 from mlx.utils import tree_flatten
 from PIL import Image
 
+from ...generate.common import _chunked_prefill_enabled
 from ...speculative.cache_state import commit_speculative_round
 from ...speculative.common import verify_forward
 from ...speculative.drafters.qwen3_dflash.config import DFlashConfig
 from ...speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+from ...speculative.utils import SpeculativePrefill
 from .checkpoint import transform_mimo_weights
 from .config import ModelConfig, VisionConfig
 from .mimo_v2_flash import Model
@@ -85,6 +87,32 @@ def check_forward():
     draft = DFlashDraftModel(config)
     draft.mask_embedding = mx.ones((64,))
     draft.bind(model)
+    prefill = SpeculativePrefill("dflash", draft)
+    assert _chunked_prefill_enabled(
+        model, draft_model=draft, draft_kind="dflash", prefill_kwargs=prefill.kwargs
+    )
+    captured = model.language_model(
+        ids, inputs_embeds=embeddings, capture_layer_ids=[0, 1]
+    ).hidden_states
+    cache = model.make_cache()
+    for i in range(0, ids.shape[1] - 3, 3):
+        chunk = model.language_model(
+            ids[:, i : i + 3],
+            inputs_embeds=embeddings[:, i : i + 3],
+            cache=cache,
+            **prefill.kwargs,
+        )
+        prefill.append(chunk)
+    final = model.language_model(
+        ids[:, -3:],
+        inputs_embeds=embeddings[:, -3:],
+        cache=cache,
+        **prefill.kwargs,
+    )
+    for actual, expected in zip(prefill.finish(final).hidden_states, captured):
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=2e-4, rtol=2e-4
+        )
     assert mx.array_equal(draft._embed_input_tokens(mx.array([[111]])), mx.ones((1, 1, 64))).item()
     logits = draft(mx.array([[2, 111, 111, 111]]), mx.concatenate(output.hidden_states, axis=-1), draft.make_cache())
     assert logits.shape == (1, 4, 128) and mx.all(mx.isfinite(logits)).item()

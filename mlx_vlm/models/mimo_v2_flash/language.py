@@ -298,6 +298,15 @@ class LanguageModel(nn.Module):
         self.model = MimoModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def chunked_prefill_policy(
+        self, *, draft_model=None, draft_kind=None, prefill_kwargs=None, **kwargs
+    ):
+        if draft_model is None:
+            return True
+        return draft_kind in ("dflash", "eagle3") and (
+            prefill_kwargs or {}
+        ).get("capture_layer_ids") is not None
+
     def __call__(
         self, inputs: mx.array, cache=None, inputs_embeds=None, mask=None, **kwargs
     ):
