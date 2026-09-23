@@ -37,6 +37,7 @@ class Attention(nn.Module):
 
         self.scale = head_dim**-0.5
         self.value_scale = args.attention_value_scale
+        self.sliding_window_size = args.sliding_window_size
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -77,15 +78,43 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attention_sink_bias,
-        )
+        if (
+            self.is_sliding_window
+            and L > 2 * self.sliding_window_size
+            and (cache is None or isinstance(cache, RotatingKVCache))
+            and isinstance(mask, mx.array)
+            and mask.ndim == 2
+            and mask.shape == (L, keys.shape[2])
+        ):
+            past = keys.shape[2] - L
+            blocks = []
+            block_size = 2 * self.sliding_window_size
+            for start in range(0, L, block_size):
+                end = min(start + block_size, L)
+                key_start = max(0, past + start - self.sliding_window_size + 1)
+                key_end = past + end
+                blocks.append(
+                    scaled_dot_product_attention(
+                        queries[:, :, start:end],
+                        keys[:, :, key_start:key_end],
+                        values[:, :, key_start:key_end],
+                        cache=cache,
+                        scale=self.scale,
+                        mask=mask[start:end, key_start:key_end],
+                        sinks=self.attention_sink_bias,
+                    )
+                )
+            output = mx.concatenate(blocks, axis=2)
+        else:
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -275,12 +304,13 @@ class LanguageModel(nn.Module):
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
         hidden_sink = [] if capture_layer_ids is not None else None
         out = self.model(
             inputs, cache, inputs_embeds=inputs_embeds,
             capture_layer_ids=capture_layer_ids, hidden_sink=hidden_sink,
         )
-        logits = self.lm_head(out)
+        logits = self.lm_head(out[:, -int(logits_to_keep) :] if logits_to_keep else out)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=[out] if return_hidden else hidden_sink,

@@ -55,6 +55,11 @@ def check_forward():
     cache = model.make_cache()
     chunks = [model.language_model(ids[:, i:i+3], inputs_embeds=embeddings[:, i:i+3], cache=cache).logits for i in range(0, ids.shape[1], 3)]
     np.testing.assert_allclose(np.array(mx.concatenate(chunks, axis=1)), np.array(reference), atol=2e-4, rtol=2e-4)
+    cache = model.make_cache()
+    model.language_model(ids[:, :6], inputs_embeds=embeddings[:, :6], cache=cache)
+    suffix = model.language_model(ids[:, 6:], inputs_embeds=embeddings[:, 6:], cache=cache, logits_to_keep=1).logits
+    assert suffix.shape == (1, 1, 128)
+    np.testing.assert_allclose(np.array(suffix), np.array(reference[:, -1:]), atol=2e-4, rtol=2e-4)
 
     # Reject three tokens after the rotating window is already full.
     block = mx.array([[4, 5, 6, 7]])
