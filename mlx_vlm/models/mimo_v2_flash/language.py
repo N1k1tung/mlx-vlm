@@ -233,6 +233,8 @@ class MimoModel(nn.Module):
         x: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
     ) -> mx.array:
         h = self.embed_tokens(x) if inputs_embeds is None else inputs_embeds
 
@@ -244,9 +246,12 @@ class MimoModel(nn.Module):
             h, cache[self.swa_idx], window_size=self.sliding_window_size
         )
 
-        for l, c in zip(self.layers, cache):
+        capture = set(capture_layer_ids or ())
+        for i, (l, c) in enumerate(zip(self.layers, cache)):
             mask = swa_mask if l.is_sliding_window else full_mask
             h = l(h, mask, cache=c)
+            if hidden_sink is not None and i in capture:
+                hidden_sink.append(h)
 
         return self.norm(h)
 
@@ -259,6 +264,15 @@ class LanguageModel(nn.Module):
         self.model = MimoModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def chunked_prefill_policy(
+        self, *, draft_model=None, draft_kind=None, prefill_kwargs=None, **kwargs
+    ):
+        if draft_model is None:
+            return True
+        return draft_kind in ("dflash", "eagle3") and (
+            prefill_kwargs or {}
+        ).get("capture_layer_ids") is not None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -268,11 +282,19 @@ class LanguageModel(nn.Module):
         logits_to_keep: Optional[int] = None,
         **kwargs,
     ):
-        out = self.model(inputs, cache, inputs_embeds=inputs_embeds)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        hidden_sink = [] if capture_layer_ids is not None else None
+        out = self.model(
+            inputs,
+            cache,
+            inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+        )
         if logits_to_keep:
             out = out[:, -int(logits_to_keep) :, :]
         out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden_sink)
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):

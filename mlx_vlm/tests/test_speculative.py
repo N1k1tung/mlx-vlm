@@ -1417,6 +1417,46 @@ def test_chunked_prefill_retains_all_drafter_features(batch):
     equal(generated.hidden, expected)
 
 
+def test_mimo_dflash_chunked_prefill_capture():
+    from mlx_vlm.generate.common import _chunked_prefill_enabled
+    from mlx_vlm.tests.test_models import DATA as MODEL_DATA
+
+    arch = module("models.mimo_v2_flash")
+    model = arch.Model(build_config(arch, MODEL_DATA["dense"]["mimo_v2_flash"]))
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+    prefill = speculative.SpeculativePrefill(
+        "dflash", NS(config=NS(target_layer_ids=[0, 2]))
+    )
+    assert _chunked_prefill_enabled(
+        model, draft_model=object(), draft_kind="dflash", prefill_kwargs=prefill.kwargs
+    )
+    assert not _chunked_prefill_enabled(
+        model, draft_model=object(), draft_kind="mtp", prefill_kwargs=prefill.kwargs
+    )
+    assert not _chunked_prefill_enabled(
+        model, draft_model=object(), draft_kind="dflash", prefill_kwargs={}
+    )
+
+    expected = model.language_model(tokens, **prefill.kwargs).hidden_states
+    cache = model.make_cache()
+    for start in (0, 2, 4):
+        output = model.language_model(
+            tokens[:, start : start + 2],
+            cache=cache,
+            logits_to_keep=1,
+            **prefill.kwargs,
+        )
+        assert output.logits.shape == (1, 1, model.config.vocab_size)
+        prefill.append(output)
+    final = model.language_model(tokens[:, -1:], cache=cache, **prefill.kwargs)
+    captured = prefill.finish(final).hidden_states
+    assert [state.shape for state in captured] == [(1, 7, model.config.hidden_size)] * 2
+    for actual, reference in zip(captured, expected):
+        np.testing.assert_allclose(
+            np.array(actual), np.array(reference), atol=2e-3, rtol=2e-3
+        )
+
+
 def test_argmax_fallback_does_not_append_twice():
     calls, caches = [], [ArraysCache(1)]
     caches[0][0] = mx.zeros((1, 1))
