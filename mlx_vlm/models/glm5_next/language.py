@@ -583,7 +583,7 @@ def _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=16, use_kernel
 # Projected MLA keys/values make prefill much faster, but unlike the latent
 # cache they grow by every attention head. Bound the transient optimization so
 # million-token contexts retain the compressed-cache memory advantage.
-_MAX_PROJECTED_PREFILL_TOKENS = 32768
+_MAX_PROJECTED_PREFILL_TOKENS = 4096
 
 
 class Glm5NextAttention(nn.Module):
