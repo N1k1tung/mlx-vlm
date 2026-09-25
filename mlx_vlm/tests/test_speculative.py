@@ -1457,6 +1457,41 @@ def test_mimo_dflash_chunked_prefill_capture():
         )
 
 
+def test_mimo_dflash2_uses_shared_cache_rollback():
+    from mlx_vlm.tests.test_models import DATA as MODEL_DATA
+
+    arch = module("models.mimo_v2_flash")
+    target = arch.Model(build_config(arch, MODEL_DATA["dense"]["mimo_v2_flash"]))
+    config = dflash_config("dflash2")
+    config.update(
+        hidden_size=target.config.hidden_size,
+        vocab_size=target.config.vocab_size,
+        num_target_layers=len(target.layers),
+    )
+    config["dflash_config"]["target_layer_ids"] = [0, 2]
+    draft_arch = module("speculative.drafters.dflash2")
+    drafter = draft_arch.Model(draft_arch.ModelConfig.from_dict(config))
+    validate_drafter_compatibility(target, drafter, "dflash")
+    drafter.bind(target)
+
+    caches = target.make_cache()
+    target.language_model(mx.array([[1, 2]]), cache=caches)
+    transaction = start_speculative_cache(caches, 2)
+    target.language_model(mx.array([[3, 4]]), cache=caches)
+    transaction.commit([1])
+    assert all(cache.offset == 3 for cache in caches)
+
+    unsupported = NS(
+        language_model=NS(
+            args=target.config,
+            model=NS(layers=target.layers),
+            make_cache=lambda: [object()],
+        )
+    )
+    with pytest.raises(ValueError, match="rollback support"):
+        validate_drafter_compatibility(unsupported, drafter, "dflash")
+
+
 def test_argmax_fallback_does_not_append_twice():
     calls, caches = [], [ArraysCache(1)]
     caches[0][0] = mx.zeros((1, 1))

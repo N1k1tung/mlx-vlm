@@ -43,11 +43,35 @@ def validate_dflash_target(config, target_model, algorithm: str) -> None:
             f"{algorithm} target vocabulary mismatch: "
             f"draft={config.vocab_size}, target={vocab_size}."
         )
-    if not hasattr(language_model, "rollback_speculative_cache"):
-        raise ValueError(
-            f"{algorithm} target {type(language_model).__name__} does not expose "
-            "speculative cache rollback support."
+    if not callable(getattr(language_model, "rollback_speculative_cache", None)):
+        # The default verifier rolls back ordinary caches through a shared transaction.
+        from ...models.cache import BatchRotatingKVCache, RotatingKVCache
+        from ..cache_state import _cache_position_reader, iter_leaf_caches
+
+        make_cache = getattr(language_model, "make_cache", None)
+        caches = tuple(iter_leaf_caches(make_cache())) if callable(make_cache) else ()
+        supported = bool(caches) and all(
+            isinstance(cache, (RotatingKVCache, BatchRotatingKVCache))
+            or all(
+                callable(getattr(cache, method, None))
+                for method in (
+                    "start_speculation",
+                    "validate_speculation",
+                    "commit_speculation",
+                    "abort_speculation",
+                )
+            )
+            or (
+                callable(getattr(cache, "trim", None))
+                and _cache_position_reader(cache) is not None
+            )
+            for cache in caches
         )
+        if not supported:
+            raise ValueError(
+                f"{algorithm} target {type(language_model).__name__} does not expose "
+                "speculative cache rollback support."
+            )
 
 
 __all__ = ["validate_dflash_target"]
