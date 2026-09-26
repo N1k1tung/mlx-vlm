@@ -403,6 +403,40 @@ def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int])
     return min(configured, max(1, int(runtime)))
 
 
+def dflash_draft_hidden_window(draft_model: nn.Module) -> Optional[int]:
+    """Trailing target-hidden positions a DFlash draft can still attend to.
+
+    A DFlash draft scores its whole block against a context of captured target
+    hidden states, so the first draft of a request projects every prompt
+    position the target captured. Windowed drafts cannot see older positions
+    anyway: ``draft_window_size`` makes every draft cache a W-token window, and
+    an all-sliding draft keeps only ``sliding_window`` keys per layer. For those
+    drafters, feeding the complete prompt costs a per-request projection of the
+    whole sequence and changes nothing. ``None`` means the draft attends to the
+    full history and every captured position must be retained.
+    """
+    config = getattr(draft_model, "config", None)
+    if config is None:
+        return None
+    override = getattr(draft_model, "draft_hidden_window", None)
+    if override is not None:
+        return int(override) if int(override) > 0 else None
+    windows = []
+    draft_window = getattr(config, "draft_window_size", None)
+    if draft_window is not None and int(draft_window) > 0:
+        windows.append(int(draft_window))
+    layer_types = getattr(config, "layer_types", None) or []
+    sliding = getattr(config, "sliding_window", None)
+    if (
+        layer_types
+        and sliding is not None
+        and int(sliding) > 0
+        and all(layer_type == "sliding_attention" for layer_type in layer_types)
+    ):
+        windows.append(int(sliding))
+    return min(windows) if windows else None
+
+
 def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
     for cache_entry in prompt_cache:
         left_padding = getattr(cache_entry, "left_padding", None)

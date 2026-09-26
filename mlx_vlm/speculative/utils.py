@@ -9,6 +9,7 @@ from .common import (
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
+    dflash_draft_hidden_window,
     speculative_stats_since,
     speculative_stats_snapshot,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "_speculative_walk_batch_deferred_greedy",
     "_speculative_walk_batch_uniform_acceptance",
     "_speculative_walk_deferred_greedy",
+    "dflash_draft_hidden_window",
     "format_speculative_stats",
     "get_speculative_rounds_batch",
     "make_speculative_prompt_cache",
@@ -125,20 +127,56 @@ class SpeculativePrefill:
             else {}
         )
         self.chunks = []
+        # A windowed draft can never attend to hidden older than its own
+        # window, so retaining the whole prompt costs a per-request projection
+        # of every captured position for nothing. ``None`` keeps full history.
+        self.hidden_window = (
+            dflash_draft_hidden_window(drafter)
+            if self.kwargs and draft_kind == "dflash"
+            else None
+        )
 
     def append(self, output):
         if self.kwargs:
             hidden = output.hidden_states
             mx.async_eval(hidden)
             self.chunks.append(hidden)
+            self._compact()
+
+    def _compact(self):
+        """Fold retained chunks into one trailing ``hidden_window`` span."""
+        window = self.hidden_window
+        if window is None:
+            return
+        kept, remaining = [], window
+        for parts in reversed(self.chunks):
+            if remaining <= 0:
+                break
+            length = parts[0].shape[1]
+            if length > remaining:
+                parts = [part[:, -remaining:] for part in parts]
+                length = remaining
+            kept.append(parts)
+            remaining -= length
+        # Dropping the leading positions shifts the drafter's positional origin
+        # uniformly for context, proposal and query alike, so RoPE distances
+        # inside the window are unchanged.
+        self.chunks = list(reversed(kept))
 
     def finish(self, output):
         if self.chunks:
-            self.chunks.append(output.hidden_states)
+            if output.hidden_states is not None:
+                self.chunks.append(output.hidden_states)
+            self._compact()
             output.hidden_states = [
                 mx.concatenate(parts, axis=1) for parts in zip(*self.chunks)
             ]
             self.chunks.clear()
+        elif self.hidden_window is not None and output.hidden_states is not None:
+            # Unchunked prompt: still trim to what a windowed draft can attend.
+            output.hidden_states = [
+                part[:, -self.hidden_window :] for part in output.hidden_states
+            ]
         return output
 
 

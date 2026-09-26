@@ -1807,3 +1807,93 @@ def test_speculative_lifetime_counters_survive_reset():
     snapshot = common.speculative_stats_snapshot(drafter)
     common._record_speculative_round(drafter, 2, 7)
     assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
+
+
+def dflash_window_drafter(**overrides):
+    model_attrs = {
+        key: overrides.pop(key) for key in ("draft_hidden_window",) if key in overrides
+    }
+    config = {
+        "draft_window_size": None,
+        "layer_types": ["full_attention"],
+        "sliding_window": None,
+    } | overrides
+    return NS(config=NS(**config), **model_attrs)
+
+
+@parametrize(
+    "overrides,expected",
+    [
+        ({}, None),
+        ({"draft_window_size": 2048}, 2048),
+        ({"draft_window_size": 0}, None),
+        ({"draft_window_size": 4096, "draft_hidden_window": 512}, 512),
+        ({"draft_hidden_window": 0}, None),
+        (
+            {"layer_types": ["sliding_attention"] * 2, "sliding_window": 1024},
+            1024,
+        ),
+        (
+            {
+                "layer_types": ["sliding_attention", "full_attention"],
+                "sliding_window": 1024,
+            },
+            None,
+        ),
+    ],
+)
+def test_dflash_draft_hidden_window(overrides, expected):
+    assert common.dflash_draft_hidden_window(dflash_window_drafter(**overrides)) == (
+        expected
+    )
+
+
+def test_dflash_prefill_retains_only_draft_hidden_window():
+    def prefill(window):
+        return speculative.SpeculativePrefill(
+            "dflash", dflash_window_drafter(draft_window_size=window)
+        )
+
+    outputs = {}
+    for name, window in (("full", None), ("windowed", 5)):
+        holder = prefill(window)
+        for start in (0, 4, 8):
+            chunk = [mx.arange(start + 4).reshape(1, 4, 1).astype(mx.float32)]
+            holder.append(NS(hidden_states=chunk))
+        outputs[name] = holder.finish(
+            NS(hidden_states=[mx.arange(12, 16).reshape(1, 4, 1)])
+        ).hidden_states
+
+    full_hidden, windowed_hidden = outputs["full"], outputs["windowed"]
+    mx.eval(full_hidden, windowed_hidden)
+    assert [part.shape[1] for part in full_hidden] == [16]
+    assert full_hidden[0].reshape(-1).tolist() == list(range(16))
+    # A windowed draft never attends to positions older than its window; the
+    # dropped prefix shifts the draft's positional origin uniformly, so RoPE
+    # distances inside the window are unchanged.
+    assert [part.shape[1] for part in windowed_hidden] == [5]
+    assert windowed_hidden[0].reshape(-1).tolist() == list(range(11, 16))
+
+    # Eagle3/MTP-shaped drafters keep the full-history contract.
+    eager = speculative.SpeculativePrefill("eagle3", dflash_window_drafter())
+    assert eager.hidden_window is None
+    eager_output = eager.finish(NS(hidden_states=[mx.zeros((1, 2, 1))]))
+    assert eager_output.hidden_states is not None
+
+
+def test_dflash_prefill_window_without_chunk_history():
+    # An unchunked prompt never reaches ``append``, so ``finish`` trims too.
+    holder = speculative.SpeculativePrefill(
+        "dflash", dflash_window_drafter(draft_window_size=3)
+    )
+    output = holder.finish(NS(hidden_states=[mx.arange(4).reshape(1, 4, 1)]))
+    assert [part.shape[1] for part in output.hidden_states] == [3]
+    mx.eval(hidden := output.hidden_states[0])
+    assert hidden.reshape(-1).tolist() == [1, 2, 3]
+    assert holder.finish(NS(hidden_states=None)).hidden_states is None
+
+    unwindowed = speculative.SpeculativePrefill(
+        "dflash", dflash_window_drafter(draft_window_size=None)
+    )
+    final = NS(hidden_states=[mx.arange(4).reshape(1, 4, 1)])
+    assert unwindowed.finish(final).hidden_states is final.hidden_states
