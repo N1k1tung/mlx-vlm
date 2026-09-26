@@ -341,6 +341,32 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
+def test_glm5_next_short_block_attention_matches_single_query_path():
+    config = tiny_config("glm", "inference")
+    attention = module("models.glm5_next.language").Glm5NextAttention(config, 1)
+    attention.load_weights(
+        [
+            (key, value.astype(mx.bfloat16))
+            for key, value in tree_flatten(attention.parameters())
+        ]
+    )
+    attention.eval()
+    batch, width, context = 2, 4, 13
+    q = mx.random.normal((batch, attention.num_heads, width, attention.q_head_dim)).astype(
+        mx.bfloat16
+    )
+    latent = mx.random.normal((batch, 1, context, attention.kv_lora_rank)).astype(
+        mx.bfloat16
+    )
+    topk = mx.broadcast_to(
+        (mx.arange(width * 4).reshape(1, width, 4) % context), (batch, width, 4)
+    )
+    topk = mx.where(topk == 0, -1, topk)
+    expected, _ = attention._attend(q, latent, latent, topk, None, None)
+    actual, _ = attention._attend(q, latent, latent, topk, KVCache(), None)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
 @parametrize("family", list(TINY_MODELS))
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])

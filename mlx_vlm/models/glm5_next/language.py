@@ -587,6 +587,11 @@ def _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=16, use_kernel
 _MAX_PROJECTED_PREFILL_TOKENS = 4096
 
 
+def _block_attendable_cache(cache):
+    # Quantized caches use their own attention path after gathering latents.
+    return type(cache) in (KVCache, BatchKVCache)
+
+
 class ProjectedKVCache(KVCache):
     """Prefill-only projection; APC restores it empty for latent reprojection."""
 
@@ -743,29 +748,39 @@ class Glm5NextAttention(nn.Module):
     ):
         batch, _, length, _ = q.shape
         if length <= DECODE_BLOCK_SIZE and not self.training:
-            outputs = []
-            start = length - 1 if last_only else 0
-            for index in range(start, length):
-                selected_indices = topk[:, index : index + 1]
-                valid = (selected_indices >= 0) & (selected_indices < latent.shape[2])
-                safe = mx.clip(selected_indices, 0, max(latent.shape[2] - 1, 0))
-                selected = mx.take_along_axis(latent, safe[:, None, 0, :, None], axis=2)
-                query = self.embed_q(q[:, :, index : index + 1])
-                output = scaled_dot_product_attention(
-                    query,
-                    selected,
-                    selected,
-                    cache=kv_cache,
-                    scale=self.scale,
-                    mask=valid[:, None],
-                )
-                output = self.unembed_out(output)
-                if length > 1:
-                    mx.async_eval(output)
-                outputs.append(output)
-            out = mx.concatenate(outputs, axis=2)
-            if last_only:
-                topk = topk[:, -1:]
+            if (
+                length == 1
+                or last_only
+                or q.dtype not in (mx.bfloat16, mx.float16)
+                or not _block_attendable_cache(kv_cache)
+            ):
+                outputs = []
+                start = length - 1 if last_only else 0
+                for index in range(start, length):
+                    selected_indices = topk[:, index : index + 1]
+                    valid = (selected_indices >= 0) & (selected_indices < latent.shape[2])
+                    safe = mx.clip(selected_indices, 0, max(latent.shape[2] - 1, 0))
+                    selected = mx.take_along_axis(
+                        latent, safe[:, None, 0, :, None], axis=2
+                    )
+                    query = self.embed_q(q[:, :, index : index + 1])
+                    output = scaled_dot_product_attention(
+                        query,
+                        selected,
+                        selected,
+                        cache=kv_cache,
+                        scale=self.scale,
+                        mask=valid[:, None],
+                    )
+                    output = self.unembed_out(output)
+                    if length > 1:
+                        mx.async_eval(output)
+                    outputs.append(output)
+                out = mx.concatenate(outputs, axis=2)
+                if last_only:
+                    topk = topk[:, -1:]
+            else:
+                out = self._attend_selected(q, latent, topk)
         else:
             previous_length = latent.shape[2] - length
             cache_matches = (
@@ -788,6 +803,31 @@ class Glm5NextAttention(nn.Module):
         output_length = 1 if last_only and length > 1 else length
         out = out.transpose(0, 2, 1, 3).reshape(batch, output_length, -1)
         return out, topk
+
+    def _attend_selected(self, q, latent, topk):
+        """Attend all short-block queries over their own selected latents."""
+        batch, heads, length, _ = q.shape
+        topk_width = topk.shape[-1]
+        valid = (topk >= 0) & (topk < latent.shape[2])
+        safe = mx.clip(
+            topk.reshape(batch, length * topk_width),
+            0,
+            max(latent.shape[2] - 1, 0),
+        )
+        selected = mx.take_along_axis(latent, safe[:, None, :, None], axis=2)
+        selected = selected.reshape(batch * length, 1, topk_width, latent.shape[-1])
+        query = self.embed_q(q).transpose(0, 2, 1, 3).reshape(
+            batch * length, heads, 1, latent.shape[-1]
+        )
+        output = mx.fast.scaled_dot_product_attention(
+            query,
+            selected,
+            selected,
+            scale=self.scale,
+            mask=valid.reshape(batch * length, 1, 1, topk_width),
+        )
+        output = self.unembed_out(output)
+        return output.reshape(batch, length, heads, -1).transpose(0, 2, 1, 3)
 
 
 class DecoderLayer(nn.Module):
