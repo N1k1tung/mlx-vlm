@@ -109,15 +109,16 @@ class DFlashAttention(nn.Module):
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
-        mask = (
-            create_causal_mask(
-                L,
-                offset=keys.shape[2] - L,
-                window_size=self.sliding_window,
-            )
-            if self.is_causal
-            else None
-        )
+        context_length = keys.shape[2] - L
+        mask = create_causal_mask(L, offset=context_length) if self.is_causal else None
+        if self.is_sliding:
+            query = context_length + mx.arange(L)[:, None]
+            key = mx.arange(context_length + L)[None]
+            context = (key < context_length) & (query - key < self.sliding_window)
+            block = key >= context_length
+            if self.is_causal:
+                block = block & (key <= query)
+            mask = context | block
         o = mx.fast.scaled_dot_product_attention(
             queries,
             keys,

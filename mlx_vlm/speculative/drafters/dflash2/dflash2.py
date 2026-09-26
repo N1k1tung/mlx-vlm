@@ -28,7 +28,9 @@ def _grouped_dynamic_convolve(
             )
         )
         kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
-        output = output + (kernel + dynamic[:, :, offset]) * values
+        # Preserve the checkpoint's separate BF16 accumulations.
+        output = output + kernel * values
+        output = output + dynamic[:, :, offset] * values
     return output.reshape(hidden.shape)
 
 

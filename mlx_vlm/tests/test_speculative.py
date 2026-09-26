@@ -1582,6 +1582,42 @@ def test_glm_dflash_greedy_quantized_verification_skips_logits():
     )
 
 
+def test_dflash2_grouped_convolution_keeps_bfloat16_rounding():
+    convolve = module(
+        "speculative.drafters.dflash2.dflash2"
+    )._grouped_dynamic_convolve
+    hidden = mx.full((1, 2, 16), 0.1, dtype=mx.bfloat16)
+    dynamic = mx.full((1, 2, 2, 4), 0.0039, dtype=mx.bfloat16)
+    base = mx.ones((2, 16), dtype=mx.bfloat16)
+    assert convolve(hidden, dynamic, base, 4)[0, 1, 0].item() == 0.201171875
+
+
+def test_dflash2_noncausal_sliding_attention_excludes_old_context():
+    arch = module("speculative.drafters.qwen3_dflash.dflash")
+    config = module("speculative.drafters.qwen3_dflash.config").DFlashConfig(
+        hidden_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        layer_types=["sliding_attention"],
+        sliding_window=2,
+        is_causal=False,
+    )
+    attention = arch.DFlashAttention(config, 0)
+    attention.q_proj.weight = mx.zeros((4, 4))
+    attention.k_proj.weight = mx.zeros((4, 4))
+    attention.v_proj.weight = mx.eye(4)
+    attention.o_proj.weight = mx.eye(4)
+    output = attention(
+        mx.zeros((1, 3, 4)),
+        mx.array([[[4.0, 0, 0, 0]]]),
+        nn.RoPE(4),
+        KVCache(),
+    )
+    assert output[0, :, 0].tolist() == [1.0, 0.0, 0.0]
+
+
 def test_mimo_dflash2_uses_shared_cache_rollback():
     from mlx_vlm.tests.test_models import DATA as MODEL_DATA
 
