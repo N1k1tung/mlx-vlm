@@ -1457,6 +1457,75 @@ def test_mimo_dflash_chunked_prefill_capture():
         )
 
 
+def test_glm_dflash_chunked_prefill_handoff():
+    from mlx_vlm.generate.common import _chunked_prefill_enabled
+
+    language_model, config = language("glm")
+
+    def get_input_embeddings(ids, pixel_values=None, mask=None, **kwargs):
+        return InputEmbeddingsFeatures(
+            inputs_embeds=language_model.model.embed_tokens(ids)
+        )
+
+    model = NS(
+        language_model=language_model,
+        get_input_embeddings=get_input_embeddings,
+    )
+    observed = []
+
+    def record_hidden(hidden):
+        observed.append(hidden)
+        return hidden
+
+    drafter = NS(
+        config=NS(target_layer_ids=[0, 1], block_size=2),
+        reset=lambda target: [],
+        prepare_target_hidden=record_hidden,
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+    assert _chunked_prefill_enabled(
+        model,
+        draft_model=drafter,
+        draft_kind="dflash",
+        prefill_kwargs={"capture_layer_ids": [0, 1]},
+    )
+
+    checkpoints = []
+    result = list(
+        generate_step(
+            tokens,
+            model,
+            None,
+            None,
+            max_tokens=1,
+            temperature=0,
+            prefill_step_size=2,
+            draft_model=drafter,
+            draft_kind="dflash",
+            prompt_cache_checkpoint=lambda processed, caches: checkpoints.append(
+                processed
+            ),
+            prompt_cache_checkpoint_lengths=[2, 4],
+        )
+    )
+    assert len(result) == 1
+    assert checkpoints == [2, 4]
+    assert [state.shape for state in observed] == [(1, 7, config.hidden_size * 2)]
+    expected = language_model(tokens, capture_layer_ids=[0, 1]).hidden_states
+    assert [state.shape for state in expected] == [(1, 7, config.hidden_size)] * 2
+    np.testing.assert_allclose(
+        np.array(observed[0]),
+        np.array(mx.concatenate(expected, axis=-1)),
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    assert language_model(tokens, logits_to_keep=1).logits.shape == (
+        1,
+        1,
+        config.vocab_size,
+    )
+
+
 def test_mimo_dflash2_uses_shared_cache_rollback():
     from mlx_vlm.tests.test_models import DATA as MODEL_DATA
 
