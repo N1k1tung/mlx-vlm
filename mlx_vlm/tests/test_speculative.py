@@ -1526,6 +1526,36 @@ def test_glm_dflash_chunked_prefill_handoff():
     )
 
 
+def test_glm_dflash_greedy_quantized_verification_skips_logits():
+    model, config = language("glm", hidden_size=32)
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, _: path.endswith("lm_head"),
+    )
+    cache = model.make_cache()
+    mx.eval(model(mx.array([[1, 2]]), cache=cache).logits)
+
+    def fail_sampler(_):
+        raise AssertionError("Greedy DFlash should verify from hidden states")
+
+    captured, transaction, tokens = module("speculative.dflash")._dflash_verify_greedy(
+        model, mx.array([[3, 4]]), cache, [0, 1], fail_sampler
+    )
+    mx.eval(captured, tokens)
+    assert [state.shape for state in captured] == [(1, 2, config.hidden_size)] * 2
+    assert tokens.shape == (1, 2)
+    transaction.abort()
+    assert not cache[0].is_speculating
+
+    hidden = mx.random.normal((1, 2, config.hidden_size)).astype(mx.bfloat16)
+    equal(
+        model.speculative_dflash_argmax_from_hidden(hidden),
+        mx.argmax(model.lm_head(hidden), axis=-1),
+    )
+
+
 def test_mimo_dflash2_uses_shared_cache_rollback():
     from mlx_vlm.tests.test_models import DATA as MODEL_DATA
 

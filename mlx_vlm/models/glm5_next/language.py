@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...speculative.ops.linear import _target_verify_quantized_argmax
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
 from ..cache import ArraysCache, BatchKVCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection
@@ -962,11 +963,37 @@ class LanguageModel(nn.Module):
             logits = linear(self.model.embed_tokens.as_linear, hidden)
         else:
             logits = linear(self.lm_head, hidden)
+        if capture_sink is not None and return_hidden:
+            capture_sink += hidden_sink
         return LanguageModelOutput(
             logits=logits,
             hidden_states=capture_sink if capture_sink is not None else hidden_sink,
             shared_kv_states={} if return_shared_kv else None,
         )
+
+    def speculative_verify_dflash_hidden(self, inputs, cache, capture_layer_ids):
+        from ...speculative.common import verify_forward
+
+        output, transaction = verify_forward(
+            self,
+            inputs,
+            cache,
+            capture_layer_ids=capture_layer_ids,
+            return_hidden=True,
+            skip_logits=True,
+        )
+        return output.hidden_states[:-1], output.hidden_states[-1], transaction
+
+    def speculative_dflash_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        if not self.args.tie_word_embeddings:
+            argmax = _target_verify_quantized_argmax(self.lm_head, hidden)
+            if argmax is not None:
+                return argmax
+        if self.args.tie_word_embeddings:
+            logits = linear(self.model.embed_tokens.as_linear, hidden)
+        else:
+            logits = linear(self.lm_head, hidden)
+        return mx.argmax(logits, axis=-1)
 
     @property
     def layers(self):
