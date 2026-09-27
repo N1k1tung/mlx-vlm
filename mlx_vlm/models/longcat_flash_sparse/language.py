@@ -12,11 +12,11 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, CacheList, KVCache
+from ..indexer_kernel import indexer_dense_scores, indexer_dense_scores_available
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
-from .indexer_kernel import indexer_dense_scores, indexer_dense_scores_available
 
 
 class NgramEmbedding(nn.Module):

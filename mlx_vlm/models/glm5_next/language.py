@@ -7,6 +7,7 @@ from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_atte
 from ..cache import ArraysCache, BatchKVCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection
 from ..gated_delta import gated_delta_update
+from ..indexer_kernel import indexer_head_reduce, indexer_head_reduce_available
 from ..linear import DECODE_BLOCK_SIZE, linear, tiled_linear
 from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
@@ -241,8 +242,19 @@ def _sparse_head_gather(values: mx.array, indices: mx.array) -> mx.array:
     ].reshape(batch * query_length, heads, topk, dim)
 
 
-def _score_index_keys(q, keys, weights, scale):
+def _score_index_keys(q, keys, weights, scale, fused=False):
+    """``Σ_h w_h relu(q_h · k_p)`` for every pool ``p``.
+
+    ``fused`` runs the ReLU, head weighting and head reduction in one kernel.
+    The un-fused form streams the ``[queries, heads, pools]`` FP32 tile three
+    more times than the GEMM writes it, which costs more than the GEMM itself.
+    """
+
     scores = q.astype(mx.float32) @ keys[:, None].astype(mx.float32).swapaxes(-1, -2)
+    if fused:
+        # ``scale`` stays folded into the weights, as below, so the fused and
+        # un-fused arithmetic match.
+        return indexer_head_reduce(scores, weights * scale, 1.0, query_major=True)
     scores = mx.maximum(scores, 0)
     return (scores * (weights * scale)[..., None]).sum(axis=2)
 
@@ -257,6 +269,7 @@ def _exact_pool_select(
     select_k,
     scale,
     chunk_size=512,
+    fused=False,
 ):
     """Select exact top-scoring pools with bounded query-side temporaries."""
 
@@ -278,7 +291,7 @@ def _exact_pool_select(
             )
         else:
             scores = _score_index_keys(
-                q[:, start:end], pool_keys, weights[:, start:end], scale
+                q[:, start:end], pool_keys, weights[:, start:end], scale, fused=fused
             )
             scores = mx.where(candidates, scores, mx.finfo(mx.float32).min)
             selected = mx.argpartition(-scores, kth=select_k - 1, axis=-1)[
@@ -462,6 +475,7 @@ class Glm5NextIndexer(nn.Module):
                     query_positions,
                     select_k,
                     self.softmax_scale,
+                    fused=not self.training and indexer_head_reduce_available(),
                 )
 
             # ``argpartition`` guarantees the selected set, but not its order.
