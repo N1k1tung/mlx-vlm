@@ -83,6 +83,10 @@ class DFlashAttention(nn.Module):
                     )
                 S = x_ctx.shape[1]
                 cache.offset += skip
+                if isinstance(cache, BufferedRotatingKVCache):
+                    # Compaction measures retained positions from this origin.
+                    # Advancing only offset can evict the entire live window.
+                    cache.start_position += skip
 
         # Project context and proposal separately so only context KV
         queries = self.q_proj(x)
@@ -107,17 +111,23 @@ class DFlashAttention(nn.Module):
         ctx_keys = rope(ctx_keys, offset=cache.offset)
         prop_keys = rope(prop_keys, offset=cache.offset + S)
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
+        # Single-token rotating updates return physical ring order. The block
+        # mask below needs chronological positions, including after rejection.
+        if isinstance(cache, RotatingKVCache):
+            keys = cache._temporal_order(keys)
+            values = cache._temporal_order(values)
+        context_length = keys.shape[2]
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
-        mask = (
-            create_causal_mask(
-                L,
-                offset=keys.shape[2] - L,
-                window_size=self.sliding_window,
-            )
-            if self.is_causal
-            else None
-        )
+        mask = create_causal_mask(L, offset=context_length) if self.is_causal else None
+        if self.is_sliding:
+            query = context_length + mx.arange(L)[:, None]
+            key = mx.arange(context_length + L)[None]
+            context = (key < context_length) & (query - key < self.sliding_window)
+            block = key >= context_length
+            if self.is_causal:
+                block = block & (key <= query)
+            mask = context | block
         o = mx.fast.scaled_dot_product_attention(
             queries,
             keys,

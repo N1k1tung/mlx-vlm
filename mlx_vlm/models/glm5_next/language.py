@@ -860,6 +860,8 @@ class Glm5NextTextModel(nn.Module):
         cache: Optional[List[Any]] = None,
         attention_mask: Optional[mx.array] = None,
         hidden_sink: Optional[List[mx.array]] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        capture_sink: Optional[List[mx.array]] = None,
     ):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if cache is None:
@@ -871,7 +873,8 @@ class Glm5NextTextModel(nn.Module):
 
         h = mx.repeat(h[:, :, None], self.config.hc_mult, axis=2)
         topk = None
-        for layer, layer_cache in zip(self.layers, cache):
+        capture = set(capture_layer_ids or ())
+        for layer_idx, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = attention_mask
             if layer.block_type == "linear_attention" and layer_cache is not None:
                 layer_mask = create_ssm_mask(h[:, :, 0], layer_cache)
@@ -881,6 +884,8 @@ class Glm5NextTextModel(nn.Module):
                 layer_cache,
                 topk,
             )
+            if capture_sink is not None and layer_idx in capture:
+                capture_sink.append(h.mean(axis=2))
         h = self.norm(h.mean(axis=2))
         if hidden_sink is not None:
             hidden_sink.append(h)
@@ -915,6 +920,8 @@ class LanguageModel(nn.Module):
             return bool(prefill_kwargs.get("return_hidden", False)) and bool(
                 prefill_kwargs.get("return_shared_kv", False)
             )
+        if draft_kind == "dflash":
+            return prefill_kwargs.get("capture_layer_ids") is not None
         return draft_kind is None
 
     def __call__(
@@ -928,6 +935,8 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         hidden_sink = kwargs.pop("hidden_sink", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        capture_sink = [] if capture_layer_ids is not None else None
         if return_hidden and hidden_sink is None:
             hidden_sink = []
         if inputs is None:
@@ -939,8 +948,12 @@ class LanguageModel(nn.Module):
             cache,
             attention_mask,
             hidden_sink=hidden_sink,
+            capture_layer_ids=capture_layer_ids,
+            capture_sink=capture_sink,
         )
-        num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
+        num_logits_to_keep = kwargs.get(
+            "logits_to_keep", kwargs.get("num_logits_to_keep", 0)
+        )
         if num_logits_to_keep:
             hidden = hidden[:, -num_logits_to_keep:, :]
         if skip_logits:
@@ -951,7 +964,7 @@ class LanguageModel(nn.Module):
             logits = linear(self.lm_head, hidden)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
+            hidden_states=capture_sink if capture_sink is not None else hidden_sink,
             shared_kv_states={} if return_shared_kv else None,
         )
 

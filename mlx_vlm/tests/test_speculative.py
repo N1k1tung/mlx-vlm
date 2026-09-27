@@ -341,6 +341,116 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
+@parametrize("causal", [False, True])
+@parametrize("window", [None, 2048])
+def test_dflash_sliding_attention_matches_fresh_history_after_rotation(causal, window):
+    arch = module("speculative.drafters.qwen3_dflash.dflash")
+    config = module("speculative.drafters.qwen3_dflash.config").DFlashConfig(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        layer_types=["sliding_attention"],
+        sliding_window=2048,
+        is_causal=causal,
+        draft_window_size=window,
+    )
+    mx.random.seed(73)
+    model = arch.DFlashDraftModel(config)
+    attention = model.layers[0].self_attn
+    cache = model.make_cache()[0]
+    history = mx.random.normal((1, 4300, 8))
+    block = mx.random.normal((1, 5, 8))
+    position = 0
+    for count in (4093, 1, 1, 3, 1, 20, 1, 64, 1):
+        actual = attention(
+            block, history[:, position : position + count], model.rope, cache
+        )
+        position += count
+        expected = attention(
+            block, history[:, :position], model.rope, model.make_cache()[0]
+        )
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+
+
+def test_dflash2_noncausal_window_and_convolution_rounding():
+    arch = module("speculative.drafters.qwen3_dflash.dflash")
+    config = module("speculative.drafters.qwen3_dflash.config").DFlashConfig(
+        hidden_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        layer_types=["sliding_attention"],
+        sliding_window=2,
+        is_causal=False,
+    )
+    attention = arch.DFlashAttention(config, 0)
+    attention.q_proj.weight = mx.zeros((4, 4))
+    attention.k_proj.weight = mx.zeros((4, 4))
+    attention.v_proj.weight = mx.eye(4)
+    attention.o_proj.weight = mx.eye(4)
+    output = attention(
+        mx.zeros((1, 3, 4)), mx.array([[[4.0, 0, 0, 0]]]), nn.RoPE(4), KVCache()
+    )
+    assert output[0, :, 0].tolist() == [1.0, 0.0, 0.0]
+    convolve = module("speculative.drafters.dflash2.dflash2")._grouped_dynamic_convolve
+    hidden = mx.full((1, 2, 16), 0.1, dtype=mx.bfloat16)
+    dynamic = mx.full((1, 2, 2, 4), 0.0039, dtype=mx.bfloat16)
+    base = mx.ones((2, 16), dtype=mx.bfloat16)
+    assert convolve(hidden, dynamic, base, 4)[0, 1, 0].item() == 0.201171875
+
+
+def test_glm_dflash2_capture_and_generation():
+    mx.random.seed(92)
+    lm, config = language("glm", inference=True)
+    lm.eval()
+    target = NS(
+        language_model=lm,
+        get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=lm.model.embed_tokens(ids)
+        ),
+    )
+    settings = dflash_config("dflash2")
+    settings.update(
+        hidden_size=config.hidden_size,
+        vocab_size=config.vocab_size,
+        num_target_layers=config.num_hidden_layers,
+    )
+    settings["dflash_config"]["target_layer_ids"] = [0, 1]
+    arch = module("speculative.drafters.dflash2")
+    draft = arch.Model(arch.ModelConfig.from_dict(settings))
+    draft.eval()
+    assert generated(target, draft) == generated(target)
+
+    tokens = mx.array([[1, 2, 3, 4, 5]])
+    kwargs = dict(capture_layer_ids=[0, 1], logits_to_keep=1)
+    expected = lm(tokens, **kwargs)
+    assert expected.logits.shape == (1, 1, config.vocab_size)
+    prefill = speculative.SpeculativePrefill("dflash", draft)
+    cache = lm.make_cache()
+    for start in (0, 2):
+        prefill.append(lm(tokens[:, start : start + 2], cache=cache, **kwargs))
+    actual = prefill.finish(lm(tokens[:, -1:], cache=cache, **kwargs))
+    equal(actual.hidden_states, expected.hidden_states, atol=2e-3, rtol=2e-3)
+
+
+def test_dflash2_greedy_uses_candidate_selector():
+    draft = dflash_drafter("dflash2")
+    target = dflash_target("dflash2")
+    draft.bind(target)
+    draft.argmax_from_hidden = lambda _: (_ for _ in ()).throw(
+        AssertionError("DFlash2 must score candidate transitions")
+    )
+    hidden = mx.zeros((1, 4, draft.config.hidden_size))
+    expected = draft.draft_block(1, hidden, draft.make_cache(), 3, greedy)
+    actual = draft.draft_block_greedy(1, hidden, draft.make_cache(), 3, greedy)
+    equal(actual, expected)
+
+
 @parametrize("family", list(TINY_MODELS))
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])

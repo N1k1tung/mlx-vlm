@@ -28,7 +28,9 @@ def _grouped_dynamic_convolve(
             )
         )
         kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
-        output = output + (kernel + dynamic[:, :, offset]) * values
+        # Match the checkpoint's separate low-precision accumulations.
+        output = output + kernel * values
+        output = output + dynamic[:, :, offset] * values
     return output.reshape(hidden.shape)
 
 
@@ -191,6 +193,10 @@ class DFlash2DraftModel(DFlashDraftModel):
             anchor,
             sampler,
         ).astype(token_dtype)
+
+    # DFlash2 always needs its transition selector, even when the target offers
+    # an argmax-only head for ordinary DFlash drafts.
+    draft_block_greedy = draft_block
 
     def sanitize(self, weights: Mapping[str, mx.array]) -> dict[str, mx.array]:
         normalized = {}
